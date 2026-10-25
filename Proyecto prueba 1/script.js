@@ -69,7 +69,7 @@ function seedDemo() {
 }
 
 /* ---------- Cálculos ---------- */
-const subStatus = s => { if (s.status === 'cancelled') return 'cancelled'; const days = daysUntil(s.next); return days <= (s.remind ?? 3) + 4 && days >= 0 ? 'soon' : 'active'; };
+const subStatus = s => { if (s.status === 'cancelled') return 'cancelled'; const days = daysUntil(s.next); return days <= (s.remind ?? 3) && days >= 0 ? 'soon' : 'active'; };
 const daysUntil = ds => Math.round((startOfDay(ds + 'T00:00') - startOfDay(new Date())) / 864e5);
 const monthlyCost = s => s.freq === 'weekly' ? s.price * 52 / 12 : s.freq === 'yearly' ? s.price / 12 : s.price;
 const sum = a => a.reduce((t, e) => t + e.amount, 0);
@@ -80,12 +80,29 @@ function stats() {
   const month = ex.filter(e => inMonth(e, now.getMonth(), now.getFullYear()));
   const prevM = ex.filter(e => inMonth(e, prev.getMonth(), prev.getFullYear()));
   const today = ex.filter(e => sameDay(new Date(e.date), now));
+  const wkStart = startOfDay(now); wkStart.setDate(wkStart.getDate() - ((wkStart.getDay() + 6) % 7)); // lunes
+  const week = ex.filter(e => { const d = new Date(e.date); return d >= wkStart && d <= now; });
   const byCat = {}; month.forEach(e => byCat[e.cat] = (byCat[e.cat] || 0) + e.amount);
   const days = [...Array(7)].map((_, i) => { const d = new Date(now); d.setDate(d.getDate() - (6 - i)); return { d, total: sum(ex.filter(e => sameDay(new Date(e.date), d))) }; });
   const months = [...Array(6)].map((_, i) => { const d = new Date(now.getFullYear(), now.getMonth() - (5 - i), 1); return { d, total: sum(ex.filter(e => inMonth(e, d.getMonth(), d.getFullYear()))) }; });
   const small = ex.filter(e => e.amount <= 20000 && (now - new Date(e.date)) < 30 * 864e5);
   const smallGroups = {}; small.forEach(e => { const k = e.desc.trim().toLowerCase(); (smallGroups[k] ||= { name: e.desc, n: 0, total: 0 }).n++; smallGroups[k].total += e.amount; });
-  return { month, prevM, today, byCat, days, months, total: sum(month), prevTotal: sum(prevM), todayTotal: sum(today), small, smallTop: Object.values(smallGroups).filter(g => g.n >= 2).sort((a, b) => b.total - a.total).slice(0, 5) };
+  return { month, prevM, today, byCat, days, months, total: sum(month), prevTotal: sum(prevM), todayTotal: sum(today), week, weekTotal: sum(week), small, smallTop: Object.values(smallGroups).filter(g => g.n >= 2).sort((a, b) => b.total - a.total).slice(0, 5) };
+}
+function advanceRenewals() { // Avanza la fecha de renovación al siguiente ciclo cuando ya pasó
+  let changed = false;
+  Store.data.subs.forEach(s => {
+    if (s.status === 'cancelled' || !s.next) return;
+    let guard = 0;
+    while (daysUntil(s.next) < 0 && guard++ < 1000) {
+      const d = new Date(s.next + 'T00:00');
+      if (s.freq === 'weekly') d.setDate(d.getDate() + 7);
+      else if (s.freq === 'yearly') d.setFullYear(d.getFullYear() + 1);
+      else { const day = d.getDate(); d.setDate(1); d.setMonth(d.getMonth() + 1); d.setDate(Math.min(day, new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate())); }
+      s.next = toDateInput(d); changed = true;
+    }
+  });
+  if (changed) Store.save();
 }
 function refreshNotifs() { // Notificaciones derivadas de suscripciones (locales, no push)
   const { subs, notifs, settings } = Store.data; if (!settings.notifTypes.renewals) return;
@@ -166,7 +183,7 @@ function subModal(id) {
     <div class="row2"><label class="field"><span>Precio (COP)</span><input name="price" inputmode="numeric" value="${ed ? ed.price : ''}"><em class="err" hidden></em></label>
     <label class="field"><span>Frecuencia</span><select name="freq">${Object.entries(FREQ).map(([k, v]) => `<option value="${k}" ${ed?.freq === k ? 'selected' : ''}>${v}</option>`).join('')}</select></label></div>
     <div class="row2"><label class="field"><span>Próxima renovación</span><input name="next" type="date" value="${ed?.next || toDateInput(new Date())}"></label>
-    <label class="field"><span>Recordar antes</span><select name="remind">${[0, 1, 3, 7].map(n => `<option value="${n}" ${(ed?.remind ?? 3) === n ? 'selected' : ''}>${n ? n + ' día' + (n > 1 ? 's' : '') : 'El mismo día'}</option>`).join('')}</select></label></div>
+    <label class="field"><span>Recordar antes</span><select name="remind">${[0, 1, 3, 7].map(n => `<option value="${n}" ${(ed?.remind ?? Store.data.settings.remindDays ?? 3) === n ? 'selected' : ''}>${n ? n + ' día' + (n > 1 ? 's' : '') : 'El mismo día'}</option>`).join('')}</select></label></div>
     <label class="field"><span>Estado</span><select name="status"><option value="active" ${ed?.status !== 'cancelled' ? 'selected' : ''}>Activa</option><option value="cancelled" ${ed?.status === 'cancelled' ? 'selected' : ''}>Cancelada</option></select></label>
     <div class="modal-foot"><button type="button" class="btn btn-ghost" data-close>Cancelar</button><button class="btn btn-primary">${ed ? 'Guardar' : 'Añadir suscripción'}</button></div></form>`,
     (root, close) => {
@@ -199,14 +216,14 @@ const Views = {
     const subTotal = d.subs.filter(x => x.status !== 'cancelled').reduce((t, x) => t + monthlyCost(x), 0);
     const hasData = d.expenses.length > 0, st = d.settings;
     const budgetPct = st.budget ? Math.min(100, Math.round(s.total / st.budget * 100)) : 0;
-    const avail = st.income ? st.income - s.total - subTotal * 0 : null;
+    const avail = st.income ? st.income - s.total - subTotal : null;
     const smallTotal = sum(s.small);
     if (!hasData && !d.subs.length) return `<div class="page-head"><div><small>${hi}</small><h1>Hola, ${esc(name)} 👋</h1></div></div><div class="card">${emptyState('i-wallet', 'Empieza registrando tu primer gasto', 'En segundos verás cuánto gastas, en qué y qué suscripciones se vienen.', '<button class="btn btn-primary" data-add>Registrar gasto</button><button class="btn btn-ghost btn-sm" data-demo>Cargar datos de ejemplo</button>')}</div>`;
     return `<div class="page-head"><div><small>${hi}</small><h1>Hola, ${esc(name)} 👋</h1></div><small>${new Date().toLocaleDateString('es-CO', { weekday: 'long', day: 'numeric', month: 'long' })}</small></div>
     <div class="grid g-hero">
       <div class="card hero-card"><span class="label">Gastado este mes</span><div class="big num">${cop(s.total)}</div>${delta(s.total, s.prevTotal)}
         ${st.budget ? `<div class="progress ${budgetPct > 90 ? 'warn' : ''}" style="position:relative;z-index:1;margin-top:18px"><i style="width:${budgetPct}%"></i></div><small style="position:relative;z-index:1">${budgetPct}% de tu presupuesto de ${cop(st.budget)}</small>` : `<p class="muted" style="margin-top:14px;position:relative;z-index:1;font-size:13px">Define un presupuesto en <a class="link" href="#configuracion">Configuración</a> para seguir tu avance.</p>`}</div>
-      <div class="card stat"><span class="label">Hoy</span><div class="big num">${cop(s.todayTotal)}</div><span class="pill soft">${s.today.length} gasto${s.today.length === 1 ? '' : 's'} hoy</span></div>
+      <div class="card stat"><span class="label">Hoy</span><div class="big num">${cop(s.todayTotal)}</div><span class="pill soft">${s.today.length} gasto${s.today.length === 1 ? '' : 's'} hoy</span> <span class="pill neutral" style="margin-top:6px">Esta semana: ${cop(s.weekTotal)}</span></div>
       <div class="card stat"><span class="label">Movimientos del mes</span><div class="big num">${s.month.length}</div>
         ${avail !== null ? `<span class="pill ${avail >= 0 ? 'ok' : 'bad'}">Disponible ${cop(avail)}</span>` : `<span class="pill neutral">Sin ingresos registrados</span>`}</div>
     </div>
@@ -298,7 +315,7 @@ function renderExpenseList() {
   el.innerHTML = `<div class="list">${html}</div>`;
 }
 function render() {
-  refreshNotifs();
+  advanceRenewals(); refreshNotifs();
   const unread = Store.data.notifs.filter(n => !n.read).length;
   const link = (r, cls) => `<a href="#${r[0]}" class="${App.route === r[0] ? 'active' : ''}" ${App.route === r[0] ? 'aria-current="page"' : ''}>${ic(r[2])}<span>${cls ? r[1].replace('Suscripciones', 'Subs').replace('Estadísticas', 'Stats').replace('Configuración', 'Ajustes').replace('Notificaciones', 'Avisos') : r[1]}</span>${!cls && r[0] === 'notificaciones' && unread ? `<b class="badge">${unread}</b>` : ''}</a>`;
   $('#nav').innerHTML = ROUTES.map(r => link(r)).join('');
